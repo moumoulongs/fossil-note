@@ -1,1 +1,95 @@
-1
+为了实现分支级完全透明​（用户无法感知分支存在），需在以下核心流程中添加权限控制：
+
+​场景	​相关函数	​检查逻辑
+​克隆仓库	clone_cmd()	检查用户是否有权限克隆目标分支（如 --private）。
+​同步数据	client_sync()	拉取/推送前检查用户是否有权限访问目标分支。
+​本地分支操作	checkout()、log()	切换分支或查看日志时，检查用户是否有权限访问该分支。
+​推送更改	push()、commit()	提交或推送前检查目标分支的写权限。
+======================================================================================
+
+1. client_sync()
+作用：处理同步逻辑（拉取/推送数据），是权限控制的核心战场。
+新增权限检查的典型位置：
+
+c
+int client_sync(unsigned syncFlags, unsigned configRcvMask, unsigned configSendMask,
+                 const char *zAltPCode, int *pnRcvd){
+  // 在同步开始前，检查用户是否有权限访问目标分支
+  const char *zBranch = get_current_branch(); // 获取当前操作的分支名
+  if( !user_has_permission(zBranch, "access") ){
+      return SQLITE_ERROR; // 或自定义权限错误码
+  }
+  // ...原有同步逻辑...
+}
+原因：
+
+​数据流向控制：所有同步操作（拉取/推送）必须经过此函数。
+​细粒度控制：此处可针对具体分支名检查权限（如 user_has_permission(zBranch, "push")）。
+​兼容性：不影响其他命令（如 clone、log）的独立权限逻辑。
+======================================================================================
+
+2. clone_cmd()
+作用：处理克隆操作，需在初始化仓库时检查分支权限。
+新增权限检查的典型位置：
+
+c
+void clone_cmd(void){
+  // 在克隆私有分支时检查权限
+  if( find_option("private",0,0)!=0 ){
+      const char *zBranch = "private"; // 假设私有分支名为 "private"
+      if( !user_has_permission(zBranch, "clone") ){
+          fossil_fatal("insufficient permissions to clone private branch");
+      }
+  }
+  // ...原有克隆逻辑...
+}
+原因：
+
+​私有分支保护：克隆私有分支时需显式权限。
+​操作前置检查：在初始化仓库前阻断无权限用户的克隆行为
+======================================================================================
+权限查看代码
+
+int user_has_permission(const char *zUser, const char *zBranchName){
+    int hasPermission = 0;
+    db_prepare(&stmt, "SELECT 1 FROM branch_permissions WHERE branch_name = ? AND user_name = ?");
+    db_bind_text(&stmt, 1, zBranchName);
+    db_bind_text(&stmt, 2, zUser);
+    if( db_step(&stmt) == SQLITE_ROW ){
+        hasPermission = 1;
+    }
+    db_finalize(&stmt);
+    return hasPermission;
+}
+
+======================================================================================
+
+/*
+** Delete all private content from a repository.
+*/
+void delete_private_content(void){
+  fix_private_blob_dependencies(1);
+  db_multi_exec(
+    "DELETE FROM blob WHERE rid IN private;"
+    "DELETE FROM delta WHERE rid IN private;"
+    "DELETE FROM private;"
+    "DROP TABLE IF EXISTS modreq;"
+  );
+}
+
+删除私有内容的代码，可以参考一下
+
+======================================================================================
+
+xfer.c \ branch.c \ clone.c \ sync.c \
+
+xfer.c里添加一下  0x40000
+
+branch_new重新去看一下有没有遗漏
+
+======================================================================================
+
+大致流程：
+branch_new新建分支类型-->新建数据库-->权限查询-->内容管理
+
+权限写入
